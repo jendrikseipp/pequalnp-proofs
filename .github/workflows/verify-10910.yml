@@ -1,0 +1,90 @@
+name: Verify L-meta-10910
+on:
+  push:
+    branches: ['verify/L-meta-10910']
+    paths: ['.github/workflows/verify-10910.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      PROOF: 607c39c8cbe0fc0f9afa5132a3f3634338975d44
+      BASE: 7c36b22b361f248699778a2b5dd0cbcf5e940220
+      FILE: lean/PEqualNP/Outside/L_meta_10910.lean
+    steps:
+      - name: Check the proof commit and its posted statement
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q .
+          git fetch --quiet --depth 2 https://github.com/jendrikseipp/pequalnp-proofs.git "$PROOF"
+          git checkout --quiet --detach FETCH_HEAD
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          test "$(git diff-tree -r --no-commit-id --name-only HEAD)" = "$FILE"
+          test "$(git hash-object "$FILE")" = f37a959f13e9415498f6cb66786de2193a5a237d
+          mkdir "$RUNNER_TEMP/posted"
+          curl -fsS --proto '=https' --retry 2 https://data.pequalnp.com/data/desk/gaps.json -o "$RUNNER_TEMP/gaps.json"
+          node .github/scripts/outside-guard.mjs gap "$RUNNER_TEMP/gaps.json" L-meta-10910 "$FILE" "$RUNNER_TEMP/posted" check
+          node .github/scripts/outside-guard.mjs imports "$FILE" "$RUNNER_TEMP/posted/imports.json" "$FILE" check
+          sh .github/scripts/install-elan.sh v4.4.0 0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2 "$HOME/.elan" "$(cat lean/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare memory for the Lean verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          swap_kib=$(awk '/SwapTotal:/{print $2}' /proc/meminfo)
+          additional_mib=$((12288 - swap_kib / 1024))
+          if [ "$additional_mib" -gt 0 ]; then
+            read -r available mountpoint < <(df -m --output=avail,target / /mnt | tail -n +2 | sort -rn | head -n 1)
+            budget=$((available - 10000))
+            if [ "$additional_mib" -gt "$budget" ]; then additional_mib=$budget; fi
+            if [ "$additional_mib" -ge 512 ]; then
+              swapfile="${mountpoint%/}/lean-10910.swap"
+              sudo install -m 600 /dev/null "$swapfile"
+              sudo fallocate -l "${additional_mib}M" "$swapfile"
+              sudo mkswap -q "$swapfile"
+              sudo swapon "$swapfile"
+            fi
+          fi
+          free -m
+          awk '/^SwapTotal:/ { if ($2 < 8388608) exit 1 }' /proc/meminfo
+
+      - name: Fetch pinned Mathlib artifacts
+        working-directory: lean
+        run: lake exe cache get
+
+      - name: Build the theorem and run the project verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          mem=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          cap=$((mem - 3145728))
+          test "$cap" -gt 4194304
+          unit="lean-proof-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          verdict="$RUNNER_TEMP/verdict"
+          sudo -n systemd-run --quiet --scope --collect --unit="$unit" -p MemoryMax="${cap}K" \
+            --uid="$(id -u)" --gid="$(id -g)" env HOME="$HOME" PATH="$PATH" MALLOC_ARENA_MAX=2 \
+            timeout -k 30 1200 node tools/check-lean.mjs "$FILE" "$RUNNER_TEMP/posted/statement.txt" check > "$verdict" 2>&1 &
+          runner_pid=$!
+          while kill -0 "$runner_pid" 2>/dev/null; do
+            available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+            swapfree=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)
+            if (( available < 1433600 || (available < 2097152 && swapfree < 524288) )); then
+              echo "Stopping the verifier with $available KiB of available memory and $swapfree KiB of free swap."
+              sudo -n systemctl kill --signal=KILL "$unit.scope" || true
+              wait "$runner_pid" || true
+              tail -n 20 "$verdict"
+              exit 125
+            fi
+            sleep 1
+          done
+          rc=0
+          wait "$runner_pid" || rc=$?
+          cat "$verdict"
+          test "$rc" -eq 0
+          grep -q '^ACCEPTED' "$verdict"
