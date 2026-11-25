@@ -1,0 +1,66 @@
+name: Verify L-meta-10317
+on:
+  push:
+    branches: ['verify/L-meta-10317']
+    paths: ['.github/workflows/verify-10317.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      PROOF: 2a93b346acd719b97ceef46745860150c4540f42
+      BASE: bb4f27ea2a8fd3ff84bff9663aca8f1c118ac870
+      FILE: lean/PEqualNP/Outside/L_meta_10317.lean
+    steps:
+      - name: Check the proof commit and its posted statement
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q .
+          git fetch --quiet --depth 2 https://github.com/jendrikseipp/pequalnp-proofs.git "$PROOF"
+          git checkout --quiet --detach FETCH_HEAD
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          test "$(git diff-tree -r --no-commit-id --name-only HEAD)" = "$FILE"
+          test "$(git hash-object "$FILE")" = d1c36eb15c1c9d41e4ce674e891ff070538b0f0d
+          mkdir "$RUNNER_TEMP/posted"
+          curl -fsS --proto '=https' --retry 2 https://data.pequalnp.com/data/desk/gaps.json -o "$RUNNER_TEMP/gaps.json"
+          node .github/scripts/outside-guard.mjs gap "$RUNNER_TEMP/gaps.json" L-meta-10317 "$FILE" "$RUNNER_TEMP/posted" check
+          node .github/scripts/outside-guard.mjs imports "$FILE" "$RUNNER_TEMP/posted/imports.json" "$FILE" check
+          sh .github/scripts/install-elan.sh v4.4.0 0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2 "$HOME/.elan" "$(cat lean/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare memory for the Lean verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          swap_kib=$(awk '/SwapTotal:/{print $2}' /proc/meminfo)
+          additional_mib=$((8192 - swap_kib / 1024))
+          if [ "$additional_mib" -gt 0 ]; then
+            read -r available mountpoint < <(df -m --output=avail,target / /mnt | tail -n +2 | sort -rn | head -n 1)
+            budget=$((available - 10000))
+            if [ "$additional_mib" -gt "$budget" ]; then additional_mib=$budget; fi
+            if [ "$additional_mib" -ge 512 ]; then
+              swapfile="${mountpoint%/}/lean-10317.swap"
+              sudo install -m 600 /dev/null "$swapfile"
+              sudo fallocate -l "${additional_mib}M" "$swapfile"
+              sudo mkswap -q "$swapfile"
+              sudo swapon "$swapfile"
+            fi
+          fi
+          free -m
+
+      - name: Fetch pinned Mathlib artifacts
+        working-directory: lean
+        run: lake exe cache get
+
+      - name: Build the theorem and run the project verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LEAN_NUM_THREADS=2 MALLOC_ARENA_MAX=2
+          timeout -k 30 1800 node tools/check-lean.mjs "$FILE" "$RUNNER_TEMP/posted/statement.txt" check | tee "$RUNNER_TEMP/verdict"
+          grep -q '^ACCEPTED' "$RUNNER_TEMP/verdict"
